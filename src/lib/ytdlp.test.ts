@@ -83,3 +83,38 @@ test('a finished file is found even when yt-dlp printed no path', async () => {
 
   await fs.rm(dir, {recursive: true, force: true})
 })
+
+test('without ffmpeg nothing is merged and silent streams say so', () => {
+  const withMuxed: VideoInfo = {
+    title: 'clip',
+    duration: 100,
+    formats: [
+      ...(youtubeish.formats ?? []),
+      {format_id: '18', ext: 'mp4', vcodec: 'avc1.42', acodec: 'mp4a', height: 360, tbr: 500, filesize: 6_000_000, protocol: 'https'},
+    ],
+  }
+  const choices = buildChoices(withMuxed, {ffmpeg: false})
+
+  // 360p carries its own audio; the higher ones can only come without it, and
+  // the label has to admit that before the download, not after
+  assert.deepEqual(choices.map(c => c.label), [
+    '720p · mp4 · muted · 7.6 MB',
+    '480p · mp4 · muted · 3.8 MB',
+    '360p · mp4 · 5.7 MB',
+    'audio only · webm · 2.0 MB',
+  ])
+  // and nothing asks yt-dlp to merge or re-encode
+  const args = choices.flatMap(c => c.args).join(' ')
+  assert.ok(!args.includes('+'), args)
+  assert.ok(!args.includes('-x'), args)
+})
+
+test('with ffmpeg present the merged formats stay', () => {
+  assert.equal(buildChoices(youtubeish, {ffmpeg: true}).length, buildChoices(youtubeish).length)
+})
+
+test('a list where nothing has sound leaves the labels alone', () => {
+  // every line saying "muted" is noise; the footer's ffmpeg notice says it once
+  const labels = buildChoices(youtubeish, {ffmpeg: false}).map(c => c.label)
+  assert.deepEqual(labels, ['720p · mp4 · 7.6 MB', '480p · mp4 · 3.8 MB', 'audio only · webm · 2.0 MB'])
+})

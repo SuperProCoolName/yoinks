@@ -181,22 +181,35 @@ export function autoUpdateYtDlp(): () => void {
   return () => controller.abort()
 }
 
+export type FfmpegStatus = {
+  /** False when neither merging streams nor making an mp3 is possible. */
+  available: boolean
+  /** Only set when ffmpeg isn't on PATH — yt-dlp finds that one by itself. */
+  location?: string
+}
+
 /**
  * Find ffmpeg for stream merging / mp3 extraction: system install first,
- * ffmpeg-static as fallback. Returns undefined if neither exists — yt-dlp
- * still works for single-file formats without it.
+ * ffmpeg-static as fallback. Its absence isn't fatal — yt-dlp still handles
+ * formats that arrive as one finished file — but it has to be known before
+ * the format list is built, not discovered halfway through a download.
  */
-export async function findFfmpeg(): Promise<string | undefined> {
-  if (await commandWorks('ffmpeg', ['-version'])) return undefined // on PATH, yt-dlp finds it itself
+export async function findFfmpeg(): Promise<FfmpegStatus> {
+  if (await commandWorks('ffmpeg', ['-version'])) return {available: true}
   try {
     const mod = await import('ffmpeg-static')
     const ffmpegPath = (mod.default ?? mod) as unknown as string | null
-    if (ffmpegPath && (await commandWorks(ffmpegPath, ['-version']))) return ffmpegPath
+    if (ffmpegPath && (await commandWorks(ffmpegPath, ['-version']))) return {available: true, location: ffmpegPath}
   } catch {
     // ffmpeg-static not installed or unsupported platform
   }
-  return undefined
+  return {available: false}
 }
+
+/** Shown when ffmpeg is missing, so the shorter list on screen has a reason. */
+export const FFMPEG_HINT = `no ffmpeg, no sound or mp3 — ${
+  process.platform === 'win32' ? 'winget install ffmpeg' : process.platform === 'darwin' ? 'brew install ffmpeg' : 'apt install ffmpeg'
+}`
 
 export type VideoInfo = {
   title: string
@@ -347,10 +360,13 @@ const isHls = (f: RawFormat) => /m3u8/.test(f.protocol ?? '')
 /** LAME at --audio-quality 0 lands around here, whatever the source bitrate is. */
 const MP3_KBPS = 245
 
-export function buildChoices(info: VideoInfo): DownloadChoice[] {
+export function buildChoices(info: VideoInfo, opts: {ffmpeg?: boolean} = {}): DownloadChoice[] {
   const formats = info.formats ?? []
   const duration = info.duration
   const choices: DownloadChoice[] = []
+  // without ffmpeg nothing can be merged or re-encoded, so only formats that
+  // arrive as one finished file are worth offering
+  const canMerge = opts.ffmpeg !== false
 
   const audioOnly = formats
     .filter(f => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'))
@@ -361,51 +377,78 @@ export function buildChoices(info: VideoInfo): DownloadChoice[] {
   const mergeAudio = audioOnly.find(f => f.ext === 'm4a') ?? bestAudio
   const mergeAudioSize = mergeAudio ? sizeOf(mergeAudio, duration) : undefined
 
-  const videos = formats.filter(f => f.vcodec && f.vcodec !== 'none' && f.height)
+  const playable = formats.filter(f => f.vcodec && f.vcodec !== 'none')
+  const videos = playable.filter(f => f.height)
   const heights = [...new Set(videos.map(f => f.height as number))].sort((a, b) => b - a)
+  // with no ffmpeg a stream that already carries its own audio is worth more
+  // than any bitrate — it is the only kind that arrives with sound
+  const rank = (f: RawFormat) => scoreVideo(f) + (!canMerge && f.acodec && f.acodec !== 'none' ? 100_000 : 0)
+  // when every line would say "muted" the label is just noise — the footer's
+  // ffmpeg notice covers it. Only a mixed list needs marking
+  const someHaveSound = !canMerge && videos.some(f => f.acodec && f.acodec !== 'none')
 
   for (const height of heights.slice(0, MAX_VIDEO_CHOICES)) {
     const candidates = videos.filter(f => f.height === height)
-    const best = [...candidates].sort((a, b) => scoreVideo(b) - scoreVideo(a))[0]
+    const best = [...candidates].sort((a, b) => rank(b) - rank(a))[0]
     const muxed = Boolean(best.acodec && best.acodec !== 'none')
     const videoSize = sizeOf(best, duration)
-    const size = muxed ? videoSize : addSizes(videoSize, mergeAudioSize)
+    const size = muxed || !canMerge ? videoSize : addSizes(videoSize, mergeAudioSize)
     // name the exact streams we measured, so the number on screen is the
     // number that gets downloaded; the generic selectors stay as a fallback
     // for when a format id has expired by the time the user picks it
-    const pinned = muxed || !mergeAudio ? best.format_id : `${best.format_id}+${mergeAudio.format_id}`
+    const pinned = muxed || !canMerge || !mergeAudio ? best.format_id : `${best.format_id}+${mergeAudio.format_id}`
     choices.push({
       kind: 'video',
-      label: `${height}p · mp4${sizeLabel(size)}`,
-      args: [
-        '-f',
-        `${pinned}/bv*[height=${height}]+ba/b[height=${height}]/bv*[height<=${height}]+ba/b`,
-        '--merge-output-format',
-        'mp4',
-      ],
+      // merging always lands in mp4; without it the container is whatever came
+      label: `${height}p · ${canMerge ? 'mp4' : best.ext ?? 'mp4'}${!muxed && someHaveSound ? ' · muted' : ''}${sizeLabel(size)}`,
+      args: canMerge
+        ? [
+            '-f',
+            `${pinned}/bv*[height=${height}]+ba/b[height=${height}]/bv*[height<=${height}]+ba/b`,
+            '--merge-output-format',
+            'mp4',
+          ]
+        : ['-f', `${pinned}/b[height<=${height}]`],
     })
   }
 
   if (choices.length === 0) {
     // sites that serve one plain file have no resolutions to choose between,
     // but they usually do know how big that file is
-    const only = [...formats.filter(f => f.vcodec && f.vcodec !== 'none')].sort((a, b) => scoreVideo(b) - scoreVideo(a))[0]
+    const only = [...playable].sort((a, b) => scoreVideo(b) - scoreVideo(a))[0]
     const size = only ? sizeOf(only, duration) : undefined
     choices.push({
       kind: 'video',
-      label: `best available · mp4${sizeLabel(size)}`,
-      args: ['-f', 'bv*+ba/b', '--merge-output-format', 'mp4'],
+      label: `best available · ${canMerge ? 'mp4' : only?.ext ?? 'mp4'}${sizeLabel(size)}`,
+      args: canMerge ? ['-f', 'bv*+ba/b', '--merge-output-format', 'mp4'] : ['-f', 'b'],
     })
   }
 
-  // the mp3 is re-encoded, so the source track's size says nothing about
-  // what lands on disk — the target bitrate does
-  const mp3Size: Size | undefined = duration ? {bytes: (MP3_KBPS * 1000 * duration) / 8, exact: false} : undefined
-  choices.push({
-    kind: 'audio',
-    label: `audio only · mp3${sizeLabel(mp3Size)}`,
-    args: ['-f', `${bestAudio ? `${bestAudio.format_id}/` : ''}ba/b`, '-x', '--audio-format', 'mp3', '--audio-quality', '0'],
-  })
+  if (canMerge) {
+    // the mp3 is re-encoded, so the source track's size says nothing about
+    // what lands on disk — the target bitrate does
+    const mp3Size: Size | undefined = duration ? {bytes: (MP3_KBPS * 1000 * duration) / 8, exact: false} : undefined
+    choices.push({
+      kind: 'audio',
+      label: `audio only · mp3${sizeLabel(mp3Size)}`,
+      args: [
+        '-f',
+        `${bestAudio ? `${bestAudio.format_id}/` : ''}ba/b`,
+        '-x',
+        '--audio-format',
+        'mp3',
+        '--audio-quality',
+        '0',
+      ],
+    })
+  } else if (bestAudio) {
+    // no converter, but the original track can still be saved as it comes
+    choices.push({
+      kind: 'audio',
+      label: `audio only · ${bestAudio.ext ?? 'm4a'}${sizeLabel(sizeOf(bestAudio, duration))}`,
+      args: ['-f', `${bestAudio.format_id}/ba`],
+    })
+  }
 
   return choices
 }

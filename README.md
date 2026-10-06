@@ -97,7 +97,10 @@ click the theme control in the footer to cycle through `auto`, `light`, and
 - Fragmented streams (YouTube, HLS) are fetched four fragments at a time,
   which gets around per-connection throttling.
 - ffmpeg (needed for merging high-res streams and mp3 extraction) is found
-  on your PATH, with `ffmpeg-static` as a bundled fallback.
+  on your PATH, with `ffmpeg-static` as a bundled fallback. It is looked up
+  before the format list is built, so on a machine without it the list only
+  offers what can be downloaded as one finished file, and the footer says
+  what is missing — instead of failing halfway through a download.
 - The UI is [Ink](https://github.com/vadimdemedes/ink) — React for the
   terminal.
 

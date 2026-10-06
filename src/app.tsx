@@ -22,9 +22,11 @@ import {
   buildChoices,
   download,
   ensureYtDlp,
+  FFMPEG_HINT,
   findFfmpeg,
   probe,
   type DownloadChoice,
+  type FfmpegStatus,
   type DownloadProgress,
   type VideoInfo,
 } from './lib/ytdlp.js'
@@ -189,6 +191,10 @@ function AppContent({
   const [info, setInfo] = useState<VideoInfo>()
   const [choices, setChoices] = useState<DownloadChoice[]>([])
   const ytdlpRef = useRef('')
+  // looked up once per session, before the format list is built: what ffmpeg
+  // can't do has to be known while there is still a choice to make
+  const ffmpegRef = useRef<FfmpegStatus | undefined>(undefined)
+  const [ffmpegMissing, setFfmpegMissing] = useState(false)
   // cookies for this session: dropped for good once they prove unusable
   const cookiesRef = useRef(cookiesFrom)
   // …and the ones the current link actually went out with, so the download
@@ -216,6 +222,8 @@ function AppContent({
       ytdlpRef.current = ytdlp
       if (controller.signal.aborted) return
       setPhase({name: 'probing', status: 'fetching video info…'})
+      const ffmpeg = (ffmpegRef.current ??= await findFfmpeg())
+      setFfmpegMissing(!ffmpeg.available)
       // cookies a browser we guessed may be locked, encrypted, or simply
       // unwelcome on this site — never let them cost a link that works
       // signed out anyway
@@ -240,7 +248,7 @@ function AppContent({
       if (controller.signal.aborted) return
       infoJsonRef.current = infoJsonPath
       setInfo(videoInfo)
-      setChoices(buildChoices(videoInfo))
+      setChoices(buildChoices(videoInfo, {ffmpeg: ffmpeg.available}))
       highlightRef.current = 0
       setPhase({name: 'picking'})
     } catch (error) {
@@ -318,10 +326,9 @@ function AppContent({
           setPhase(prev => (prev.name === 'downloading' ? {...prev, processing: true} : prev)),
       }
       try {
-        const ffmpegLocation = await findFfmpeg()
         const base = {
           ytdlp: ytdlpRef.current,
-          ffmpegLocation,
+          ffmpegLocation: ffmpegRef.current?.location,
           url,
           choice,
           cookiesFrom: usedCookiesRef.current,
@@ -574,6 +581,10 @@ function AppContent({
                   </Text>
                   <Text color={theme.gray} dimColor={theme.dimSecondary}> {phase.status}</Text>
                 </Text>
+              ) : phase.name === 'picking' && ffmpegMissing ? (
+                // the list is shorter than usual on this machine — say why
+                // here, next to the choices it affects
+                <Text color={theme.gray} dimColor={theme.dimSecondary}>{FFMPEG_HINT}</Text>
               ) : phase.name === 'input' && (activeCookies || outDirIsCustom) ? (
                 // remembered settings are silent otherwise: "why is it logged
                 // in as me?" and "where did my file go?" deserve an answer on
