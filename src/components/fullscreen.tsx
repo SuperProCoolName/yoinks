@@ -32,8 +32,13 @@ export function FullScreen({children}: {children: ReactNode}) {
       {/* single wrapper so centering leftover lands on ONE node: when the
           leftover is odd, yoga gives every direct child a *.5 y-position and
           rounds each one independently — spacer rows collapse into their
-          neighbors while extra blanks open up elsewhere */}
-      <Box flexDirection="column" alignItems="center" flexShrink={0}>
+          neighbors while extra blanks open up elsewhere.
+          Full width for the same reason sideways: sized to its content, the
+          wrapper is as wide as its widest line, so a footer that grows by an
+          odd number of cells shifts it by half a cell — rounded twice, some
+          rows jumped a cell and some didn't. Against the whole screen every
+          row is centered once, on its own */}
+      <Box flexDirection="column" alignItems="center" flexShrink={0} width={size.columns}>
         {children}
       </Box>
     </Box>
