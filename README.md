@@ -37,6 +37,7 @@ $ yoinks                                 # prompts for a url
 $ yoinks --theme light                   # force the light palette
 $ yoinks --update                        # refresh the bundled yt-dlp now
 $ yoinks --cookies none                  # download signed out
+$ yoinks --out D:\Video                  # save somewhere else, and remember it
 ```
 
 Some links need you to be logged in: private accounts, stories, anything
@@ -64,10 +65,17 @@ yoinks takes over the terminal (full-screen, centered — and restores your
 scrollback on exit). Pick a format with ↑/↓ (or j/k, or number keys) and
 hit enter. `esc` goes back, `^c` quits. Or just use the mouse — the yoink
 button, the format list and the footer hints are all clickable, and
-clicking the logo takes you back home. Files are saved to `~/Downloads`,
-and the file path is printed to your terminal when you're done. On the
-finished screen, `o` opens the download in your file manager (Finder and
-Explorer highlight the file itself).
+clicking the logo takes you back home. The file path is printed to your
+terminal when you're done, and `o` on the finished screen opens the folder
+in your file manager (Finder highlights the file itself).
+
+Files land in this machine's downloads folder — the real one, taken from
+Windows' known-folder record or the desktop's `XDG_DOWNLOAD_DIR`, so a
+folder that was moved, redirected into OneDrive or localised (Загрузки,
+Téléchargements) still works. `--out <folder>` sends them somewhere else
+and is remembered; `--out auto` hands the choice back. A folder that
+doesn't exist yet is created, and the footer names the folder whenever it
+isn't the default one.
 
 The default `auto` theme uses your terminal's own foreground and background,
 so it follows light and dark terminal themes without guessing. Press `^t` or

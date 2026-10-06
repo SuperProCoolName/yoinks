@@ -7,6 +7,7 @@ import {parseArgs} from './lib/args.js'
 import {readClipboard} from './lib/clipboard.js'
 import {detectCookieBrowser} from './lib/browsers.js'
 import {loadConfig, saveConfig} from './lib/config.js'
+import {detectDownloadsDir, ensureDir, resolveUserDir} from './lib/downloads-dir.js'
 import {isProbablyUrl} from './lib/platforms.js'
 import {autoUpdateYtDlp, sweepStaleInfoFiles, updateYtDlp} from './lib/ytdlp.js'
 
@@ -32,12 +33,16 @@ const HELP = `
                          YouTube, which rejects borrowed cookies.
                          --cookies none stays signed out, --cookies auto
                          restores picking. Whatever you choose is remembered
+    --out <folder>       save downloads there instead of the system
+                         downloads folder; --out auto goes back to it.
+                         Remembered too
     --theme <mode>       use auto, light, or dark for this run
     --update             update the bundled yt-dlp now, then exit
     -h, --help           show this help
     -v, --version        show version
 
-  Downloads are saved to ~/Downloads.
+  Downloads are saved to your system downloads folder unless --out says
+  otherwise.
   yt-dlp refreshes itself in the background about once a week.
   Private, age-gated and most Instagram links need --cookies.
   Powered by yt-dlp — YouTube, X, Instagram, Threads, TikTok & 1800+ sites.
@@ -99,6 +104,23 @@ const cookiesAuto = config.cookiesFrom === undefined
 const cookiesFrom =
   config.cookiesFrom === 'off' ? undefined : cookiesAuto ? detectCookieBrowser() : config.cookiesFrom
 
+// `--out <folder>` picks where files land and is remembered; `--out auto`
+// hands the choice back to the system downloads folder, wherever that is
+if (args.outDir) {
+  const stored = args.outDir === 'auto' ? undefined : resolveUserDir(args.outDir)
+  if (stored) {
+    const problem = ensureDir(stored)
+    if (problem) {
+      console.error(`yoinks: ${problem}`)
+      process.exit(1)
+    }
+  }
+  saveConfig({...config, outDir: stored})
+  config.outDir = stored
+}
+const outDirIsCustom = Boolean(config.outDir)
+const outDir = config.outDir ?? detectDownloadsDir()
+
 const isTTY = Boolean(process.stdout.isTTY)
 
 // no url given — offer the clipboard url (⇥ to paste) when it already holds one
@@ -140,6 +162,8 @@ const {waitUntilExit} = render(
     initialThemeMode={initialThemeMode}
     cookiesFrom={cookiesFrom}
     cookiesAuto={cookiesAuto}
+    outDir={outDir}
+    outDirIsCustom={outDirIsCustom}
     onOutcome={result => (outcome = result)}
   />,
   // keep a copy of every frame so clicks can be hit-tested against it

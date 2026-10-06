@@ -1,6 +1,5 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react'
 import os from 'node:os'
-import path from 'node:path'
 import {Box, Text, useApp, useInput, useStdout} from 'ink'
 import SelectInput, {type IndicatorProps, type ItemProps} from 'ink-select-input'
 import Spinner from 'ink-spinner'
@@ -30,7 +29,6 @@ import {
   type VideoInfo,
 } from './lib/ytdlp.js'
 
-const OUT_DIR = path.join(os.homedir(), 'Downloads')
 const YOINK_BUTTON = 'yoink'
 const DONE_LABEL = '↵ yoink another'
 const TAGLINE = 'yoink any video. paste. yoink. done.'
@@ -137,6 +135,10 @@ type AppProps = {
   cookiesFrom?: string
   /** True when the browser was guessed rather than chosen — see cli.tsx. */
   cookiesAuto?: boolean
+  /** Where finished files land — resolved in cli.tsx, never guessed here. */
+  outDir: string
+  /** True when the user picked the folder, so it is worth showing on screen. */
+  outDirIsCustom?: boolean
   onOutcome: (outcome: Outcome) => void
 }
 
@@ -163,6 +165,8 @@ function AppContent({
   clipboardUrl,
   cookiesFrom,
   cookiesAuto,
+  outDir,
+  outDirIsCustom,
   onOutcome,
   cycleTheme,
 }: {
@@ -170,6 +174,8 @@ function AppContent({
   clipboardUrl?: string
   cookiesFrom?: string
   cookiesAuto?: boolean
+  outDir: string
+  outDirIsCustom?: boolean
   onOutcome: (outcome: Outcome) => void
   cycleTheme: () => void
 }) {
@@ -319,7 +325,7 @@ function AppContent({
           url,
           choice,
           cookiesFrom: usedCookiesRef.current,
-          outDir: OUT_DIR,
+          outDir,
         }
         let filepath: string
         try {
@@ -568,10 +574,15 @@ function AppContent({
                   </Text>
                   <Text color={theme.gray} dimColor={theme.dimSecondary}> {phase.status}</Text>
                 </Text>
-              ) : phase.name === 'input' && activeCookies ? (
-                // a remembered --cookies setting is silent otherwise, and
-                // "why is it logged in as me?" deserves an answer on screen
-                <Text color={theme.gray} dimColor={theme.dimSecondary}>cookies: {activeCookies}</Text>
+              ) : phase.name === 'input' && (activeCookies || outDirIsCustom) ? (
+                // remembered settings are silent otherwise: "why is it logged
+                // in as me?" and "where did my file go?" deserve an answer on
+                // screen. The default downloads folder needs no announcement
+                <Text color={theme.gray} dimColor={theme.dimSecondary}>
+                  {[activeCookies && `cookies: ${activeCookies}`, outDirIsCustom && `→ ${shortenPath(outDir, os.homedir(), 28)}`]
+                    .filter(Boolean)
+                    .join('  ·  ')}
+                </Text>
               ) : undefined
             }
           />

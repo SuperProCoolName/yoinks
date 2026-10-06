@@ -29,15 +29,20 @@ export type Config = {
    * stay signed out, and unset means "figure it out" — see detectCookieBrowser.
    */
   cookiesFrom?: CookieBrowser | 'off'
+  /** Where to save files. Unset means "wherever this machine keeps downloads". */
+  outDir?: string
 }
 
 export function loadConfig(): Config {
   try {
     const parsed: unknown = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'))
     if (!parsed || typeof parsed !== 'object') return {}
-    const {cookiesFrom} = parsed as {cookiesFrom?: unknown}
-    if (cookiesFrom === 'off') return {cookiesFrom: 'off'}
-    return typeof cookiesFrom === 'string' && isCookieBrowser(cookiesFrom) ? {cookiesFrom} : {}
+    const {cookiesFrom, outDir} = parsed as {cookiesFrom?: unknown; outDir?: unknown}
+    const config: Config = {}
+    if (cookiesFrom === 'off') config.cookiesFrom = 'off'
+    else if (typeof cookiesFrom === 'string' && isCookieBrowser(cookiesFrom)) config.cookiesFrom = cookiesFrom
+    if (typeof outDir === 'string' && outDir) config.outDir = outDir
+    return config
   } catch {
     return {}
   }

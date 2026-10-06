@@ -12,6 +12,8 @@ export type CliArgs = {
    * picking an installed browser by itself.
    */
   cookiesFrom?: CookieBrowser | 'none' | 'auto'
+  /** A folder to save into, or 'auto' to go back to the system downloads folder. */
+  outDir?: string | 'auto'
   error?: string
 }
 
@@ -48,6 +50,14 @@ export function parseArgs(args: string[]): CliArgs {
       const parsed = readCookiesValue(value)
       if (!parsed) return {...result, error: `can’t read cookies from “${value}” — use ${COOKIE_VALUES}`}
       result.cookiesFrom = parsed
+    } else if (arg === '--out' || arg === '-o') {
+      const value = args[++index]
+      if (!value) return {...result, error: '--out needs a folder, or “auto” for the system downloads folder'}
+      result.outDir = value
+    } else if (arg.startsWith('--out=')) {
+      const value = arg.slice('--out='.length)
+      if (!value) return {...result, error: '--out needs a folder, or “auto” for the system downloads folder'}
+      result.outDir = value
     } else if (arg === '--theme') {
       const value = args[++index]
       if (!value) return {...result, error: '--theme needs a value: auto, light, or dark'}
