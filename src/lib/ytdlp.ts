@@ -79,15 +79,27 @@ async function fetchYtDlp(dest: string, signal?: AbortSignal): Promise<void> {
   }
 }
 
+/** The first candidate that answers `--version`, in order. */
+export async function firstWorking(
+  candidates: string[],
+  works: (cmd: string) => Promise<boolean> = cmd => commandWorks(cmd, ['--version']),
+): Promise<string | undefined> {
+  for (const candidate of candidates) {
+    if (await works(candidate)) return candidate
+  }
+  return undefined
+}
+
 /**
- * Resolve a usable yt-dlp binary: system install first, then a previously
- * downloaded copy, then download the standalone binary from GitHub releases.
+ * Resolve a usable yt-dlp binary: our own copy first — it is the one kept
+ * fresh every week — then one already on PATH, and only then a download of
+ * the standalone binary from GitHub releases. A system yt-dlp from a distro
+ * package can be months behind, which is exactly when sites break.
  */
 export async function ensureYtDlp(onStatus: (message: string) => void, signal?: AbortSignal): Promise<string> {
-  if (await commandWorks('yt-dlp', ['--version'])) return 'yt-dlp'
-
   const local = managedYtDlpPath()
-  if (await commandWorks(local, ['--version'])) return local
+  const found = await firstWorking([local, 'yt-dlp'])
+  if (found) return found
 
   onStatus('first run: fetching yt-dlp…')
   await fetchYtDlp(local, signal)
@@ -132,15 +144,16 @@ async function updateCheckDue(): Promise<boolean> {
 /**
  * Refresh the copy of yt-dlp in ~/.yoinks/bin. A yt-dlp that came from the
  * user's package manager is reported, never overwritten — that install isn't
- * ours to touch.
+ * ours to touch. It only matters when there is no copy of our own: with one,
+ * that copy is what runs, so that copy is what gets updated.
  */
 export async function updateYtDlp(signal?: AbortSignal): Promise<UpdateResult> {
-  if (await commandWorks('yt-dlp', ['--version'])) {
-    return {status: 'system', version: await commandOutput('yt-dlp', ['--version'])}
-  }
-
   const local = managedYtDlpPath()
   const current = await commandOutput(local, ['--version'])
+
+  if (!current && (await commandWorks('yt-dlp', ['--version']))) {
+    return {status: 'system', version: await commandOutput('yt-dlp', ['--version'])}
+  }
 
   let latest: string | undefined
   try {
@@ -619,7 +632,7 @@ export function download(
           totalParts = (line.split('format(s):')[1] ?? '').trim().split('+').length
         } else if (line.startsWith(PATH_PREFIX)) {
           filepath = line.slice(PATH_PREFIX.length)
-        } else if (line.includes('[Merger]') || line.includes('[ExtractAudio]')) {
+        } else if (isPostProcessorLine(line)) {
           const merging = /^\[Merger\] Merging formats into "(.+)"$/.exec(line)?.[1]
           const extracting = /^\[ExtractAudio\] Destination: (.+)$/.exec(line)?.[1]
           const target = merging ?? extracting
@@ -701,7 +714,7 @@ async function waitForTreeExit(pid: number | undefined, ms = KILL_GRACE_MS): Pro
   }
 }
 
-async function removePartials(destinations: string[]): Promise<void> {
+export async function removePartials(destinations: string[]): Promise<void> {
   const targets = new Set<string>()
   for (const dest of destinations) {
     const ext = path.extname(dest)
@@ -722,6 +735,15 @@ async function removePartials(destinations: string[]): Promise<void> {
   }
   await Promise.allSettled([...targets].map(file => fs.rm(file, {force: true})))
 }
+
+/**
+ * yt-dlp's post-processors announce themselves as "[Merger] …",
+ * "[ExtractAudio] …", "[FixupM4a] Correcting container of …" and so on. Any
+ * of them means the download is over and ffmpeg is at work — the screen has
+ * to say "processing", not sit on a full bar looking frozen.
+ */
+export const isPostProcessorLine = (line: string) =>
+  /^\[(Merger|ExtractAudio|Fixup\w*|VideoRemuxer|VideoConvertor|ModifyChapters|SponsorBlock|EmbedThumbnail|Metadata)\]/.test(line)
 
 function toNumber(value: string | undefined): number | undefined {
   if (!value || value === 'NA' || value === 'None') return undefined

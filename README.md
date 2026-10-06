@@ -47,19 +47,24 @@ since Chromium browsers encrypt their cookie store on macOS and Windows)
 and lets yt-dlp borrow its cookies. The footer names the browser in use.
 If borrowed cookies turn out to be unusable — locked profile, encrypted
 store, a site that rejects them — it quietly carries on signed out rather
-than failing the download.
+than failing the download. Errors that signing out can't fix (no network,
+a deleted video, a site that wants an account) are shown straight away
+instead of being tried twice.
 
 YouTube is the one exception: automatic sign-in skips it. YouTube rotates
 the cookies of a signed-in session constantly, so a running browser's jar
 is usually stale by the time yt-dlp reads it, and the player answers
 “The page needs to be reloaded” for a video that downloads fine signed
 out. Pinning a browser with `--cookies firefox` still covers YouTube —
-that one is a deliberate choice, and age-gated videos need it.
+that one is a deliberate choice, and age-gated videos need it. When a
+video turns out to need an account that wasn't brought along, the error
+screen offers `c` to retry right away with your browser's cookies.
 
 Use `--cookies firefox` (or `chrome`, `brave`, `edge`, `safari`, …) to pin
 a specific browser, `--cookies none` to stay signed out, and
-`--cookies auto` to go back to picking automatically. Whatever you choose
-is remembered in `~/.config/yoinks/config.json`.
+`--cookies auto` to go back to picking automatically — or press `^g` on
+the start screen to step through auto, off and every installed browser.
+Whatever you choose is remembered in `~/.config/yoinks/config.json`.
 
 yoinks takes over the terminal (full-screen, centered — and restores your
 scrollback on exit). Pick a format with ↑/↓ (or j/k, or number keys) and
@@ -67,7 +72,9 @@ hit enter. `esc` goes back, `^c` quits. Or just use the mouse — the yoink
 button, the format list and the footer hints are all clickable, and
 clicking the logo takes you back home. The file path is printed to your
 terminal when you're done, and `o` on the finished screen opens the folder
-in your file manager (Finder highlights the file itself).
+in your file manager (Finder highlights the file itself). Single-key
+shortcuts work on the Russian layout too — `щ` opens the folder just like
+`o`, and `о`/`л` move through the list like `j`/`k`.
 
 Files land in this machine's downloads folder — the real one, taken from
 Windows' known-folder record or the desktop's `XDG_DOWNLOAD_DIR`, so a
@@ -89,7 +96,9 @@ click the theme control in the footer to cycle through `auto`, `light`, and
 
 - Powered by [yt-dlp](https://github.com/yt-dlp/yt-dlp). On first run,
   yoinks downloads the standalone yt-dlp binary to `~/.yoinks/bin` —
-  no Python required. If you already have yt-dlp installed, it uses yours.
+  no Python required. That copy always comes first; a yt-dlp of your own
+  on PATH is used only while yoinks has none, since distro packages are
+  often months behind the sites they download from.
 - That downloaded copy refreshes itself in the background roughly once a
   week, because sites break old yt-dlp builds faster than anyone updates
   them by hand. `yoinks --update` does it on demand. A yt-dlp you installed

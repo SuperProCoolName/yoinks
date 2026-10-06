@@ -3,7 +3,7 @@ import test from 'node:test'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import {buildChoices, resolveFinalPath, type VideoInfo} from './ytdlp.js'
+import {buildChoices, firstWorking, isPostProcessorLine, removePartials, resolveFinalPath, type VideoInfo} from './ytdlp.js'
 
 // a youtube-shaped answer: every resolution exists twice, once as a plain
 // https stream that yt-dlp has measured and once as an hls copy it hasn't
@@ -117,4 +117,62 @@ test('a list where nothing has sound leaves the labels alone', () => {
   // every line saying "muted" is noise; the footer's ffmpeg notice says it once
   const labels = buildChoices(youtubeish, {ffmpeg: false}).map(c => c.label)
   assert.deepEqual(labels, ['720p · mp4 · 7.6 MB', '480p · mp4 · 3.8 MB', 'audio only · webm · 2.0 MB'])
+})
+
+test('our own yt-dlp beats one found on PATH', async () => {
+  const tried: string[] = []
+  const works = async (cmd: string) => {
+    tried.push(cmd)
+    return true
+  }
+  assert.equal(await firstWorking(['/home/u/.yoinks/bin/yt-dlp', 'yt-dlp'], works), '/home/u/.yoinks/bin/yt-dlp')
+  // and PATH isn't even asked once ours answers
+  assert.deepEqual(tried, ['/home/u/.yoinks/bin/yt-dlp'])
+  // a broken copy of ours falls through to the system one
+  assert.equal(await firstWorking(['ours', 'yt-dlp'], async cmd => cmd === 'yt-dlp'), 'yt-dlp')
+  assert.equal(await firstWorking(['ours', 'yt-dlp'], async () => false), undefined)
+})
+
+test('every post-processor counts as processing, not just merge and mp3', () => {
+  for (const line of [
+    '[Merger] Merging formats into "/d/clip.mp4"',
+    '[ExtractAudio] Destination: /d/clip.mp3',
+    '[FixupM4a] Correcting container of "/d/clip.m4a"',
+    '[FixupM3u8] Fixing MPEG-TS in MP4 container of "/d/clip.mp4"',
+    '[VideoRemuxer] Remuxing video from webm to mp4',
+  ]) {
+    assert.ok(isPostProcessorLine(line), line)
+  }
+  for (const line of ['[download] Destination: /d/clip.f140.m4a', '[info] abc: Downloading 1 format(s): 140', '[youtube] abc: Downloading webpage']) {
+    assert.ok(!isPostProcessorLine(line), line)
+  }
+})
+
+test('cancel cleanup copes with awkward names and sweeps every leftover', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'yoinks-тест «кавычки» '))
+  const dest = path.join(dir, `Клип — 'quotes' & [brackets] #1 😀.mp4`)
+  const leftovers = [dest, `${dest}.part`, `${dest}.ytdl`, `${dest}.part-Frag1`, `${dest}.part-Frag12`]
+  const merging = path.join(dir, `Клип — 'quotes' & [brackets] #1 😀.temp.mp4`)
+  const bystander = path.join(dir, 'someone else.mp4')
+  for (const file of [...leftovers, merging, bystander]) await fs.writeFile(file, 'x')
+
+  await removePartials([dest])
+
+  assert.deepEqual(await fs.readdir(dir), ['someone else.mp4'])
+  // a destination whose folder vanished must not throw
+  await removePartials([path.join(dir, 'gone', 'clip.mp4')])
+  await fs.rm(dir, {recursive: true, force: true})
+})
+
+test('the finished file is found under an awkward name too', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'yoinks-'))
+  const file = path.join(dir, 'Видео: "часть 2" (финал) ?.mp4'.replace(/[:"?]/g, process.platform === 'win32' ? '_' : '$&'))
+  await fs.writeFile(file, 'x')
+  assert.equal(await resolveFinalPath('', file), file)
+  await fs.rm(dir, {recursive: true, force: true})
+})
+
+test('a page with no formats at all still offers something to try', () => {
+  const labels = buildChoices({title: 'bare'}).map(c => c.label)
+  assert.deepEqual(labels, ['best available · mp4', 'audio only · mp3'])
 })

@@ -84,10 +84,35 @@ export function cookiesForUrl(
   return guessed && detectPlatform(url).key === 'youtube' ? undefined : cookiesFrom
 }
 
+/** Every installed browser we could borrow cookies from, best first. */
+export function installedCookieBrowsers(exists: (dir: string) => boolean = fs.existsSync): CookieBrowser[] {
+  return profileCandidates()
+    .filter(([, dirs]) => dirs.some(dir => exists(dir)))
+    .map(([browser]) => browser)
+}
+
 /** First installed browser we can borrow cookies from, if any. */
 export function detectCookieBrowser(exists: (dir: string) => boolean = fs.existsSync): CookieBrowser | undefined {
-  for (const [browser, dirs] of profileCandidates()) {
-    if (dirs.some(dir => exists(dir))) return browser
-  }
-  return undefined
+  return installedCookieBrowsers(exists)[0]
+}
+
+/** What the config stores: a pinned browser, 'off', or undefined for "pick one". */
+export type CookieMode = CookieBrowser | 'off' | undefined
+
+/** The cookie setting in effect: which browser, and whether we guessed it. */
+export function resolveCookies(
+  mode: CookieMode,
+  detect: () => CookieBrowser | undefined = detectCookieBrowser,
+): {cookiesFrom?: CookieBrowser; cookiesAuto: boolean} {
+  if (mode === 'off') return {cookiesAuto: false}
+  if (mode) return {cookiesFrom: mode, cookiesAuto: false}
+  return {cookiesFrom: detect(), cookiesAuto: true}
+}
+
+/** auto → off → each installed browser → auto again: the on-screen switch. */
+export function nextCookieMode(mode: CookieMode, installed: CookieBrowser[]): CookieMode {
+  const cycle: CookieMode[] = [undefined, 'off', ...installed]
+  const index = cycle.indexOf(mode)
+  // a pinned browser that has since been uninstalled restarts the cycle
+  return index === -1 ? undefined : cycle[(index + 1) % cycle.length]
 }

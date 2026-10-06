@@ -5,7 +5,6 @@ import {App, type Outcome} from './app.js'
 import {captureFrames} from './lib/click-map.js'
 import {parseArgs} from './lib/args.js'
 import {readClipboard} from './lib/clipboard.js'
-import {detectCookieBrowser} from './lib/browsers.js'
 import {loadConfig, saveConfig} from './lib/config.js'
 import {detectDownloadsDir, ensureDir, resolveUserDir} from './lib/downloads-dir.js'
 import {isProbablyUrl} from './lib/platforms.js'
@@ -32,7 +31,8 @@ const HELP = `
                          picks an installed browser itself — never for
                          YouTube, which rejects borrowed cookies.
                          --cookies none stays signed out, --cookies auto
-                         restores picking. Whatever you choose is remembered
+                         restores picking. ^g on the start screen switches
+                         it too. Whatever you choose is remembered
     --out <folder>       save downloads there instead of the system
                          downloads folder; --out auto goes back to it.
                          Remembered too
@@ -98,11 +98,9 @@ if (args.cookiesFrom) {
   saveConfig({...config, cookiesFrom: stored})
   config.cookiesFrom = stored
 }
-// an auto-picked browser may not hold usable cookies — the app falls back to
-// signed-out rather than failing a download over it
-const cookiesAuto = config.cookiesFrom === undefined
-const cookiesFrom =
-  config.cookiesFrom === 'off' ? undefined : cookiesAuto ? detectCookieBrowser() : config.cookiesFrom
+// the app resolves the mode itself (and can switch it on screen); an
+// auto-picked browser that holds no usable cookies falls back to signed-out
+// rather than failing a download over it
 
 // `--out <folder>` picks where files land and is remembered; `--out auto`
 // hands the choice back to the system downloads folder, wherever that is
@@ -160,8 +158,7 @@ const {waitUntilExit} = render(
     initialUrl={initialUrl}
     clipboardUrl={clipboardUrl}
     initialThemeMode={initialThemeMode}
-    cookiesFrom={cookiesFrom}
-    cookiesAuto={cookiesAuto}
+    initialCookieMode={config.cookiesFrom}
     outDir={outDir}
     outDirIsCustom={outDirIsCustom}
     onOutcome={result => (outcome = result)}

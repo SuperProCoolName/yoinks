@@ -1,7 +1,6 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react'
 import os from 'node:os'
 import {Box, Text, useApp, useInput, useStdout} from 'ink'
-import SelectInput, {type IndicatorProps, type ItemProps} from 'ink-select-input'
 import Spinner from 'ink-spinner'
 import {FramedInput} from './components/framed-input.js'
 import {FullScreen} from './components/fullscreen.js'
@@ -13,7 +12,10 @@ import {TextInput} from './components/text-input.js'
 import {clickTargetAt, findFrameRow, frameRowSpan, type ClickTarget} from './lib/click-map.js'
 import {formatBytes, formatDuration, formatEta, formatSpeed, shortenPath, truncate, wrapText} from './lib/format.js'
 import {addToHistory, loadHistory} from './lib/history.js'
-import {cookiesForUrl} from './lib/browsers.js'
+import {cookiesForUrl, installedCookieBrowsers, nextCookieMode, resolveCookies, type CookieMode} from './lib/browsers.js'
+import {loadConfig, saveConfig} from './lib/config.js'
+import {isCookieProblem, needsSignIn, worthRetryingSignedOut} from './lib/errors.js'
+import {latinKey} from './lib/keys.js'
 import {detectPlatform, isProbablyUrl, type Platform} from './lib/platforms.js'
 import {revealInFileManager} from './lib/reveal.js'
 import {useMouseClick} from './lib/use-mouse-click.js'
@@ -37,21 +39,50 @@ const TAGLINE = 'yoink any video. paste. yoink. done.'
 
 const choiceLabel = (choice: DownloadChoice) => `${choice.kind === 'audio' ? '♪ ' : '▶ '}${choice.label}`
 
-function ChoiceIndicator({isSelected}: IndicatorProps) {
+/**
+ * The format list. Hand-rolled rather than ink-select-input so that j/k
+ * work on the Russian layout too (о/л) — that component only knows Latin.
+ * ↑↓ and j/k move, ↵ picks, a digit picks that row straight away.
+ */
+function ChoiceList({
+  choices,
+  onSelect,
+  onHighlight,
+}: {
+  choices: DownloadChoice[]
+  onSelect: (index: number) => void
+  onHighlight: (index: number) => void
+}) {
   const theme = useTheme()
-  return (
-    <Box marginRight={1}>
-      <Text color={theme.primary}>{isSelected ? '❯' : ' '}</Text>
-    </Box>
+  const [selected, setSelected] = useState(0)
+  const move = (to: number) => {
+    const next = (to + choices.length) % choices.length
+    setSelected(next)
+    onHighlight(next)
+  }
+  useInput(
+    (input, key) => {
+      const typed = latinKey(input)
+      if (key.upArrow || typed === 'k') move(selected - 1)
+      else if (key.downArrow || typed === 'j') move(selected + 1)
+      else if (key.return) onSelect(selected)
+      else if (/^[1-9]$/.test(input) && Number(input) <= choices.length) onSelect(Number(input) - 1)
+    },
+    {isActive: Boolean(process.stdin.isTTY) && choices.length > 0},
   )
-}
-
-function ChoiceItem({isSelected, label}: ItemProps) {
-  const theme = useTheme()
   return (
-    <Text color={theme.primary} bold={isSelected}>
-      {label}
-    </Text>
+    <Box flexDirection="column">
+      {choices.map((choice, index) => (
+        <Box key={index}>
+          <Box marginRight={1}>
+            <Text color={theme.primary}>{index === selected ? '❯' : ' '}</Text>
+          </Box>
+          <Text color={theme.primary} bold={index === selected}>
+            {choiceLabel(choice)}
+          </Text>
+        </Box>
+      ))}
+    </Box>
   )
 }
 
@@ -99,7 +130,12 @@ type Phase =
       refreshing?: boolean
     }
   | {name: 'done'; filepath: string}
-  | {name: 'error'; message: string}
+  | {
+      name: 'error'
+      message: string
+      /** A browser to retry with, when the site wants an account we didn't bring. */
+      signInWith?: string
+    }
 
 const HINTS: Record<Phase['name'], Array<[string, string]>> = {
   input: [
@@ -134,20 +170,14 @@ type AppProps = {
   initialUrl?: string
   clipboardUrl?: string
   initialThemeMode?: ThemeMode
-  cookiesFrom?: string
-  /** True when the browser was guessed rather than chosen — see cli.tsx. */
-  cookiesAuto?: boolean
+  /** The remembered cookie setting: a browser, 'off', or undefined for auto. */
+  initialCookieMode?: CookieMode
   /** Where finished files land — resolved in cli.tsx, never guessed here. */
   outDir: string
   /** True when the user picked the folder, so it is worth showing on screen. */
   outDirIsCustom?: boolean
   onOutcome: (outcome: Outcome) => void
 }
-
-// yt-dlp says things like "could not find firefox cookies database in …" or
-// "failed to decrypt with DPAPI"; all of them name the cookies
-const isCookieProblem = (error: unknown) =>
-  /cookie/i.test(error instanceof Error ? error.message : String(error))
 
 export function App({initialThemeMode = 'auto', ...props}: AppProps) {
   const [themeMode, setThemeMode] = useState(initialThemeMode)
@@ -165,8 +195,7 @@ export function App({initialThemeMode = 'auto', ...props}: AppProps) {
 function AppContent({
   initialUrl,
   clipboardUrl,
-  cookiesFrom,
-  cookiesAuto,
+  initialCookieMode,
   outDir,
   outDirIsCustom,
   onOutcome,
@@ -174,8 +203,7 @@ function AppContent({
 }: {
   initialUrl?: string
   clipboardUrl?: string
-  cookiesFrom?: string
-  cookiesAuto?: boolean
+  initialCookieMode?: CookieMode
   outDir: string
   outDirIsCustom?: boolean
   onOutcome: (outcome: Outcome) => void
@@ -195,12 +223,19 @@ function AppContent({
   // can't do has to be known while there is still a choice to make
   const ffmpegRef = useRef<FfmpegStatus | undefined>(undefined)
   const [ffmpegMissing, setFfmpegMissing] = useState(false)
+  // the cookie setting, switchable on screen with ^g and remembered like --cookies
+  const [cookieMode, setCookieMode] = useState(initialCookieMode)
+  const [initialCookies] = useState(() => resolveCookies(initialCookieMode))
   // cookies for this session: dropped for good once they prove unusable
-  const cookiesRef = useRef(cookiesFrom)
+  const cookiesRef = useRef(initialCookies.cookiesFrom as string | undefined)
+  // true when the browser was guessed rather than chosen — see cookiesForUrl
+  const cookiesAutoRef = useRef(initialCookies.cookiesAuto)
+  // browsers whose cookie store turned out unreadable — never offered again
+  const unreadableRef = useRef(new Set<string>())
   // …and the ones the current link actually went out with, so the download
   // repeats exactly what the probe got away with
   const usedCookiesRef = useRef<string | undefined>(undefined)
-  const [activeCookies, setActiveCookies] = useState(cookiesFrom)
+  const [activeCookies, setActiveCookies] = useState(cookiesRef.current)
   const highlightRef = useRef(0) // choice under the cursor, for the ↵ hint click
   const infoJsonRef = useRef<string | undefined>(undefined)
   const abortRef = useRef<AbortController | undefined>(undefined)
@@ -210,7 +245,37 @@ function AppContent({
   const boxWidth = Math.max(14, Math.min(64, columns - 6))
   const contentWidth = Math.max(10, Math.min(columns - 4, 78))
 
-  const startProbe = useCallback(async (targetUrl: string) => {
+  // a site that wants an account gets an offer to try again signed in, as
+  // long as this attempt went without cookies and a readable browser exists
+  const failWith = useCallback((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error)
+    const browser = [cookiesRef.current, ...installedCookieBrowsers()].find(
+      candidate => candidate && !unreadableRef.current.has(candidate),
+    )
+    const signInWith = needsSignIn(error) && !usedCookiesRef.current ? browser : undefined
+    setPhase({name: 'error', message, signInWith})
+  }, [])
+
+  const switchCookies = useCallback(() => {
+    setCookieMode(current => nextCookieMode(current, installedCookieBrowsers()))
+  }, [])
+
+  // applied and saved here rather than inside the state updater, which react
+  // may run twice
+  const firstCookieMode = useRef(true)
+  useEffect(() => {
+    if (firstCookieMode.current) {
+      firstCookieMode.current = false
+      return
+    }
+    const resolved = resolveCookies(cookieMode)
+    cookiesRef.current = resolved.cookiesFrom
+    cookiesAutoRef.current = resolved.cookiesAuto
+    setActiveCookies(resolved.cookiesFrom)
+    saveConfig({...loadConfig(), cookiesFrom: cookieMode})
+  }, [cookieMode])
+
+  const startProbe = useCallback(async (targetUrl: string, signInWith?: string) => {
     const controller = new AbortController()
     abortRef.current = controller
     setPlatform(detectPlatform(targetUrl))
@@ -227,13 +292,19 @@ function AppContent({
       // cookies a browser we guessed may be locked, encrypted, or simply
       // unwelcome on this site — never let them cost a link that works
       // signed out anyway
-      const wanted = cookiesForUrl(cookiesRef.current, cookiesAuto, targetUrl)
+      // signInWith is the user asking for it after a sign-in error, which
+      // beats every rule about guessed cookies
+      const wanted = signInWith ?? cookiesForUrl(cookiesRef.current, cookiesAutoRef.current, targetUrl)
       usedCookiesRef.current = wanted
       let result
       try {
         result = await probe(ytdlp, targetUrl, {cookiesFrom: wanted}, controller.signal)
       } catch (error) {
-        if (!cookiesAuto || !wanted || controller.signal.aborted) throw error
+        if (controller.signal.aborted) throw error
+        if (isCookieProblem(error) && wanted) unreadableRef.current.add(wanted)
+        // only a guess is worth abandoning, and only when going signed out
+        // could change the answer — not for a dead network or a missing video
+        if (signInWith || !cookiesAutoRef.current || !wanted || !worthRetryingSignedOut(error)) throw error
         // an unreadable cookie store stays unreadable: stop asking for the
         // rest of the session. Any other failure only retires the cookies
         // for this one link
@@ -253,9 +324,9 @@ function AppContent({
       setPhase({name: 'picking'})
     } catch (error) {
       if (controller.signal.aborted) return
-      setPhase({name: 'error', message: error instanceof Error ? error.message : String(error)})
+      failWith(error)
     }
-  }, [cookiesAuto])
+  }, [])
 
   useEffect(() => {
     if (initialUrl) void startProbe(initialUrl)
@@ -289,8 +360,18 @@ function AppContent({
         cycleTheme()
         return
       }
-      if (input === 'o' && !key.ctrl && !key.meta && phase.name === 'done') {
+      if (key.ctrl && input === 'g' && phase.name === 'input') {
+        switchCookies()
+        return
+      }
+      // single-key shortcuts answer on any keyboard layout: щ is o, с is c
+      const typed = key.ctrl || key.meta ? '' : latinKey(input)
+      if (typed === 'o' && phase.name === 'done') {
         openFolder(phase.filepath)
+        return
+      }
+      if (typed === 'c' && phase.name === 'error' && phase.signInWith) {
+        void startProbe(url, phase.signInWith)
         return
       }
       if (key.escape && (phase.name === 'picking' || phase.name === 'error' || phase.name === 'done')) resetToInput()
@@ -351,14 +432,19 @@ function AppContent({
         setPhase({name: 'done', filepath})
       } catch (error) {
         if (controller.signal.aborted) return
-        setPhase({name: 'error', message: error instanceof Error ? error.message : String(error)})
+        failWith(error)
       }
     })()
   }
 
   let hints: Array<[string, string]> = [...HINTS[phase.name], ['^t', `theme:${theme.mode}`]]
-  if (phase.name === 'input' && history.length > 0) {
-    hints = [hints[0]!, ['↑', 'history'], ...hints.slice(1)]
+  if (phase.name === 'input') {
+    // auto names the browser it settled on, so nobody wonders whose session it is
+    const cookies = cookieMode === 'off' ? 'off' : cookieMode ?? (activeCookies ? `auto (${activeCookies})` : 'auto')
+    hints = [hints[0]!, ...(history.length > 0 ? [['↑', 'history'] as [string, string]] : []), ['^g', `cookies:${cookies}`], ...hints.slice(1)]
+  }
+  if (phase.name === 'error' && phase.signInWith) {
+    hints = [['c', `retry with ${phase.signInWith} cookies`], ...hints]
   }
 
   // Anything a mouse user would expect to press is clickable. Targets are
@@ -367,6 +453,11 @@ function AppContent({
   const hintAction = (key: string): (() => void) | undefined => {
     if (key === '^c') return () => exit()
     if (key === '^t') return cycleTheme
+    if (key === '^g') return switchCookies
+    if (key === 'c' && phase.name === 'error' && phase.signInWith) {
+      const browser = phase.signInWith
+      return () => void startProbe(url, browser)
+    }
     if (key === 'o' && phase.name === 'done') return () => openFolder(phase.filepath)
     if (key === 'esc') return phase.name === 'probing' || phase.name === 'downloading' ? cancelRun : resetToInput
     if (key === '↵') {
@@ -471,16 +562,10 @@ function AppContent({
             </Text>
           </Box>
           <Panel title="Download" width={38}>
-            <SelectInput
-              indicatorComponent={ChoiceIndicator}
-              itemComponent={ChoiceItem}
-              items={choices.map((choice, index) => ({
-                key: String(index),
-                label: choiceLabel(choice),
-                value: index,
-              }))}
-              onSelect={handlePick}
-              onHighlight={item => (highlightRef.current = item.value)}
+            <ChoiceList
+              choices={choices}
+              onSelect={index => handlePick({value: index})}
+              onHighlight={index => (highlightRef.current = index)}
             />
           </Panel>
         </Box>
@@ -585,15 +670,12 @@ function AppContent({
                 // the list is shorter than usual on this machine — say why
                 // here, next to the choices it affects
                 <Text color={theme.gray} dimColor={theme.dimSecondary}>{FFMPEG_HINT}</Text>
-              ) : phase.name === 'input' && (activeCookies || outDirIsCustom) ? (
-                // remembered settings are silent otherwise: "why is it logged
-                // in as me?" and "where did my file go?" deserve an answer on
-                // screen. The default downloads folder needs no announcement
-                <Text color={theme.gray} dimColor={theme.dimSecondary}>
-                  {[activeCookies && `cookies: ${activeCookies}`, outDirIsCustom && `→ ${shortenPath(outDir, os.homedir(), 28)}`]
-                    .filter(Boolean)
-                    .join('  ·  ')}
-                </Text>
+              ) : phase.name === 'input' && outDirIsCustom ? (
+                // a remembered folder is silent otherwise, and "where did my
+                // file go?" deserves an answer on screen. The default
+                // downloads folder needs no announcement; cookies have their
+                // own ^g switch
+                <Text color={theme.gray} dimColor={theme.dimSecondary}>→ {shortenPath(outDir, os.homedir(), 28)}</Text>
               ) : undefined
             }
           />
