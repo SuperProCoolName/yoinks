@@ -1,4 +1,4 @@
-import {spawn, type ChildProcess} from 'node:child_process'
+import {spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams} from 'node:child_process'
 import {createWriteStream, rmSync} from 'node:fs'
 import fs from 'node:fs/promises'
 import os from 'node:os'
@@ -255,9 +255,7 @@ export async function probe(
   signal?: AbortSignal,
 ): Promise<ProbeResult> {
   const stdout = await new Promise<string>((resolve, reject) => {
-    const child = spawn(ytdlp, ['-J', '--no-playlist', '--no-warnings', ...cookieArgs(opts.cookiesFrom), url], {
-      signal,
-    })
+    const child = spawnYtDlp(ytdlp, ['-J', '--no-playlist', '--no-warnings', ...cookieArgs(opts.cookiesFrom), url], signal)
     let out = ''
     let stderr = ''
     child.stdout.on('data', chunk => (out += chunk))
@@ -495,8 +493,54 @@ const PROGRESS_PREFIX = 'YOINK|'
 const PATH_PREFIX = 'YOINKFILE|'
 const PROGRESS_TEMPLATE = `${PROGRESS_PREFIX}%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s`
 
+// yt-dlp is never alone: it runs ffmpeg to merge and to convert, and a signal
+// sent to yt-dlp alone leaves that ffmpeg writing to the file we just
+// cancelled. Everything it started has to go with it.
+const OWN_GROUP = process.platform !== 'win32'
+
+// deliberately not skipped when the child itself has already exited: a group
+// outlives its leader, and a stuck ffmpeg holding the pipes open is exactly
+// the case worth killing
+function killTree(child: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void {
+  if (!child.pid) return
+  if (process.platform === 'win32') {
+    // windows has no process groups; taskkill walks the tree instead
+    spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], {stdio: 'ignore'})
+    return
+  }
+  try {
+    process.kill(-child.pid, signal) // negative pid = the whole group
+  } catch {
+    try {
+      child.kill(signal)
+    } catch {
+      // already gone
+    }
+  }
+}
+
+/** How long a cancelled ffmpeg gets to close its file before it is killed. */
+const KILL_GRACE_MS = 2000
+
+/** Spawn yt-dlp in its own process group and tie the abort signal to it. */
+function spawnYtDlp(cmd: string, args: string[], signal?: AbortSignal): ChildProcessWithoutNullStreams {
+  const child = spawn(cmd, args, {detached: OWN_GROUP})
+  if (!signal) return child
+
+  const onAbort = () => {
+    killTree(child)
+    // the follow-up is never cancelled, not even once yt-dlp is gone: it dies
+    // first and its ffmpeg keeps the file open, which is the whole problem
+    setTimeout(() => killTree(child, 'SIGKILL'), KILL_GRACE_MS).unref()
+  }
+  if (signal.aborted) onAbort()
+  else signal.addEventListener('abort', onAbort, {once: true})
+  child.on('close', () => signal.removeEventListener('abort', onAbort))
+  return child
+}
+
 let activeChild: ChildProcess | undefined
-process.on('exit', () => activeChild?.kill('SIGTERM'))
+process.on('exit', () => activeChild && killTree(activeChild))
 
 export function download(
   opts: {
@@ -536,7 +580,7 @@ export function download(
   if (opts.ffmpegLocation) args.push('--ffmpeg-location', opts.ffmpegLocation)
 
   return new Promise((resolve, reject) => {
-    const child = spawn(opts.ytdlp, args, {signal})
+    const child = spawnYtDlp(opts.ytdlp, args, signal)
     activeChild = child
 
     let stderr = ''
@@ -602,8 +646,9 @@ export function download(
     child.on('close', code => {
       activeChild = undefined
       if (signal?.aborted) {
-        // cancelled on purpose — don't leave half-written files behind
-        void removePartials(destinations)
+        // cancelled on purpose — don't leave half-written files behind, and
+        // wait out the ffmpeg that may still be closing one of them
+        void waitForTreeExit(child.pid).then(() => removePartials(destinations))
         reject(new Error('Download cancelled.'))
         return
       }
@@ -642,12 +687,40 @@ export async function resolveFinalPath(printed: string, produced: string): Promi
   return undefined
 }
 
-function removePartials(destinations: string[]): Promise<unknown> {
-  return Promise.allSettled(
-    destinations
-      .flatMap(dest => [dest, `${dest}.part`, `${dest}.ytdl`])
-      .map(file => fs.rm(file, {force: true})),
-  )
+/** Give a killed process group time to actually die before touching its files. */
+async function waitForTreeExit(pid: number | undefined, ms = KILL_GRACE_MS): Promise<void> {
+  if (!pid || process.platform === 'win32') return
+  const until = Date.now() + ms
+  while (Date.now() < until) {
+    try {
+      process.kill(-pid, 0)
+    } catch {
+      return // the group is gone
+    }
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+}
+
+async function removePartials(destinations: string[]): Promise<void> {
+  const targets = new Set<string>()
+  for (const dest of destinations) {
+    const ext = path.extname(dest)
+    targets.add(dest)
+    targets.add(`${dest}.part`)
+    targets.add(`${dest}.ytdl`)
+    // ffmpeg merges into a neighbouring file and renames it only at the end
+    targets.add(`${dest.slice(0, dest.length - ext.length)}.temp${ext}`)
+    // an interrupted fragmented download leaves its fragments behind too
+    const base = path.basename(dest)
+    try {
+      for (const name of await fs.readdir(path.dirname(dest))) {
+        if (name.startsWith(`${base}.part-Frag`)) targets.add(path.join(path.dirname(dest), name))
+      }
+    } catch {
+      // the folder went away with the download — nothing to sweep
+    }
+  }
+  await Promise.allSettled([...targets].map(file => fs.rm(file, {force: true})))
 }
 
 function toNumber(value: string | undefined): number | undefined {
