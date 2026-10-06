@@ -447,6 +447,9 @@ export type DownloadHandlers = {
 const CONCURRENT_FRAGMENTS = '4'
 
 const PROGRESS_PREFIX = 'YOINK|'
+// tagged so the finished file's path can never be confused with some other
+// absolute path yt-dlp happens to print
+const PATH_PREFIX = 'YOINKFILE|'
 const PROGRESS_TEMPLATE = `${PROGRESS_PREFIX}%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s`
 
 let activeChild: ChildProcess | undefined
@@ -482,7 +485,7 @@ export function download(
     '--progress-template',
     `download:${PROGRESS_TEMPLATE}`,
     '--print',
-    'after_move:filepath',
+    `after_move:${PATH_PREFIX}%(filepath)s`,
     '--no-simulate',
     '-o',
     path.join(opts.outDir, '%(title).60s.%(ext)s'),
@@ -495,6 +498,8 @@ export function download(
 
     let stderr = ''
     let filepath = ''
+    // best guess from yt-dlp's own log, in case it prints no final path
+    let produced = ''
     let part = 0
     let totalParts = 1
     let lastDownloaded = 0
@@ -525,16 +530,27 @@ export function download(
         } else if (line.includes('Downloading 1 format(s):')) {
           // "[info] xxx: Downloading 1 format(s): 395+251" — each id is one file
           totalParts = (line.split('format(s):')[1] ?? '').trim().split('+').length
+        } else if (line.startsWith(PATH_PREFIX)) {
+          filepath = line.slice(PATH_PREFIX.length)
         } else if (line.includes('[Merger]') || line.includes('[ExtractAudio]')) {
           const merging = /^\[Merger\] Merging formats into "(.+)"$/.exec(line)?.[1]
           const extracting = /^\[ExtractAudio\] Destination: (.+)$/.exec(line)?.[1]
           const target = merging ?? extracting
-          if (target) destinations.push(target)
+          if (target) {
+            destinations.push(target)
+            // whatever a post-processor writes last is the file the user wants
+            produced = target
+          }
           handlers.onProcessing()
         } else if (line.startsWith('[download] Destination: ')) {
-          destinations.push(line.slice('[download] Destination: '.length))
-        } else if (path.isAbsolute(line)) {
-          filepath = line
+          const target = line.slice('[download] Destination: '.length)
+          destinations.push(target)
+          produced ??= target
+        } else {
+          // "[download] /path/file.mp4 has already been downloaded" — nothing
+          // is written this run, so no post-processor names the file
+          const existing = /^\[download\] (.+) has already been downloaded$/.exec(line)?.[1]
+          if (existing) produced = existing
         }
       }
     })
@@ -548,13 +564,39 @@ export function download(
         reject(new Error('Download cancelled.'))
         return
       }
-      if (code === 0 && filepath) {
-        resolve(filepath)
-      } else {
+      if (code !== 0) {
         reject(new Error(cleanYtDlpError(stderr) || `Download failed (yt-dlp exit code ${code}).`))
+        return
       }
+      // a finished download whose path yt-dlp never printed used to be
+      // reported as a failure, with the file sitting on disk all along
+      resolveFinalPath(filepath, produced).then(
+        found => {
+          if (found) resolve(found)
+          else reject(new Error(cleanYtDlpError(stderr) || 'yt-dlp finished but wrote no file.'))
+        },
+        () => reject(new Error('yt-dlp finished but wrote no file.')),
+      )
     })
   })
+}
+
+/**
+ * Pick the path of the file that actually exists. yt-dlp normally prints it,
+ * but it stays quiet in a few cases (a post-processor that decides there is
+ * nothing to do, an older build) — its log still names the file.
+ */
+export async function resolveFinalPath(printed: string, produced: string): Promise<string | undefined> {
+  for (const candidate of [printed, produced]) {
+    if (!candidate) continue
+    try {
+      const stat = await fs.stat(candidate)
+      if (stat.isFile()) return candidate
+    } catch {
+      // named but not there — try the next candidate
+    }
+  }
+  return undefined
 }
 
 function removePartials(destinations: string[]): Promise<unknown> {

@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import {buildChoices, type VideoInfo} from './ytdlp.js'
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import {buildChoices, resolveFinalPath, type VideoInfo} from './ytdlp.js'
 
 // a youtube-shaped answer: every resolution exists twice, once as a plain
 // https stream that yt-dlp has measured and once as an hls copy it hasn't
@@ -61,4 +64,22 @@ test('sizes the mp3 by what lame will write, not by the source track', () => {
   const audio = buildChoices(youtubeish).at(-1)
   // the 2.1 MB opus source becomes ~245 kbit/s of mp3 over 100 s
   assert.equal(audio?.label, 'audio only · mp3 · ~2.9 MB')
+})
+
+test('a finished file is found even when yt-dlp printed no path', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'yoinks-test-'))
+  const file = path.join(dir, 'clip.mp4')
+  await fs.writeFile(file, 'x')
+
+  // the printed path wins when it is there
+  assert.equal(await resolveFinalPath(file, path.join(dir, 'other.mp4')), file)
+  // and the log's own name carries the run when it isn't
+  assert.equal(await resolveFinalPath('', file), file)
+  // a name that points at nothing must not be handed back as a result
+  assert.equal(await resolveFinalPath('', path.join(dir, 'gone.mp4')), undefined)
+  assert.equal(await resolveFinalPath('', ''), undefined)
+  // a directory is not a download
+  assert.equal(await resolveFinalPath(dir, ''), undefined)
+
+  await fs.rm(dir, {recursive: true, force: true})
 })
