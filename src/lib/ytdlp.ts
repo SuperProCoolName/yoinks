@@ -216,6 +216,7 @@ type RawFormat = {
   width?: number
   abr?: number
   tbr?: number
+  protocol?: string
   filesize?: number
   filesize_approx?: number
 }
@@ -318,13 +319,47 @@ export type DownloadChoice = {
 
 const MAX_VIDEO_CHOICES = 8
 
+/**
+ * What a format weighs, and whether that is a fact or a guess. yt-dlp only
+ * reports a size for streams it has measured; for the rest the bitrate and
+ * the duration are all there is to go on.
+ */
+type Size = {bytes: number; exact: boolean}
+
+function sizeOf(f: RawFormat, duration?: number): Size | undefined {
+  if (f.filesize) return {bytes: f.filesize, exact: true}
+  if (f.filesize_approx) return {bytes: f.filesize_approx, exact: false}
+  if (f.tbr && duration) return {bytes: (f.tbr * 1000 * duration) / 8, exact: false}
+  return undefined
+}
+
+function addSizes(a: Size | undefined, b: Size | undefined): Size | undefined {
+  // one unknown part makes the total unknown — better no number than a
+  // number that is quietly missing the video track
+  if (!a || !b) return undefined
+  return {bytes: a.bytes + b.bytes, exact: a.exact && b.exact}
+}
+
+const sizeLabel = (size: Size | undefined) => (size ? ` · ${size.exact ? '' : '~'}${formatBytes(size.bytes)}` : '')
+
+const isHls = (f: RawFormat) => /m3u8/.test(f.protocol ?? '')
+
+/** LAME at --audio-quality 0 lands around here, whatever the source bitrate is. */
+const MP3_KBPS = 245
+
 export function buildChoices(info: VideoInfo): DownloadChoice[] {
   const formats = info.formats ?? []
+  const duration = info.duration
   const choices: DownloadChoice[] = []
 
-  const audioOnly = formats.filter(f => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'))
-  const bestAudio = [...audioOnly].sort((a, b) => (b.abr ?? b.tbr ?? 0) - (a.abr ?? a.tbr ?? 0))[0]
-  const audioSize = bestAudio?.filesize ?? bestAudio?.filesize_approx
+  const audioOnly = formats
+    .filter(f => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'))
+    .sort((a, b) => scoreAudio(b) - scoreAudio(a))
+  const bestAudio = audioOnly[0]
+  // an m4a track drops straight into an mp4 container; opus/webm would make
+  // yt-dlp re-encode or fall back to mkv
+  const mergeAudio = audioOnly.find(f => f.ext === 'm4a') ?? bestAudio
+  const mergeAudioSize = mergeAudio ? sizeOf(mergeAudio, duration) : undefined
 
   const videos = formats.filter(f => f.vcodec && f.vcodec !== 'none' && f.height)
   const heights = [...new Set(videos.map(f => f.height as number))].sort((a, b) => b - a)
@@ -332,15 +367,19 @@ export function buildChoices(info: VideoInfo): DownloadChoice[] {
   for (const height of heights.slice(0, MAX_VIDEO_CHOICES)) {
     const candidates = videos.filter(f => f.height === height)
     const best = [...candidates].sort((a, b) => scoreVideo(b) - scoreVideo(a))[0]
-    const muxed = best.acodec && best.acodec !== 'none'
-    const size = (best.filesize ?? best.filesize_approx ?? 0) + (muxed ? 0 : audioSize ?? 0)
-    const sizeLabel = size > 0 ? ` · ~${formatBytes(size)}` : ''
+    const muxed = Boolean(best.acodec && best.acodec !== 'none')
+    const videoSize = sizeOf(best, duration)
+    const size = muxed ? videoSize : addSizes(videoSize, mergeAudioSize)
+    // name the exact streams we measured, so the number on screen is the
+    // number that gets downloaded; the generic selectors stay as a fallback
+    // for when a format id has expired by the time the user picks it
+    const pinned = muxed || !mergeAudio ? best.format_id : `${best.format_id}+${mergeAudio.format_id}`
     choices.push({
       kind: 'video',
-      label: `${height}p · mp4${sizeLabel}`,
+      label: `${height}p · mp4${sizeLabel(size)}`,
       args: [
         '-f',
-        `bv*[height=${height}]+ba/b[height=${height}]/bv*[height<=${height}]+ba/b`,
+        `${pinned}/bv*[height=${height}]+ba/b[height=${height}]/bv*[height<=${height}]+ba/b`,
         '--merge-output-format',
         'mp4',
       ],
@@ -348,25 +387,40 @@ export function buildChoices(info: VideoInfo): DownloadChoice[] {
   }
 
   if (choices.length === 0) {
+    // sites that serve one plain file have no resolutions to choose between,
+    // but they usually do know how big that file is
+    const only = [...formats.filter(f => f.vcodec && f.vcodec !== 'none')].sort((a, b) => scoreVideo(b) - scoreVideo(a))[0]
+    const size = only ? sizeOf(only, duration) : undefined
     choices.push({
       kind: 'video',
-      label: 'best available · mp4',
+      label: `best available · mp4${sizeLabel(size)}`,
       args: ['-f', 'bv*+ba/b', '--merge-output-format', 'mp4'],
     })
   }
 
-  const audioSizeLabel = audioSize ? ` · ~${formatBytes(audioSize)}` : ''
+  // the mp3 is re-encoded, so the source track's size says nothing about
+  // what lands on disk — the target bitrate does
+  const mp3Size: Size | undefined = duration ? {bytes: (MP3_KBPS * 1000 * duration) / 8, exact: false} : undefined
   choices.push({
     kind: 'audio',
-    label: `audio only · mp3${audioSizeLabel}`,
-    args: ['-f', 'ba/b', '-x', '--audio-format', 'mp3', '--audio-quality', '0'],
+    label: `audio only · mp3${sizeLabel(mp3Size)}`,
+    args: ['-f', `${bestAudio ? `${bestAudio.format_id}/` : ''}ba/b`, '-x', '--audio-format', 'mp3', '--audio-quality', '0'],
   })
 
   return choices
 }
 
+function scoreAudio(f: RawFormat): number {
+  let score = f.abr ?? f.tbr ?? 0
+  if (isHls(f)) score -= 1_000
+  return score
+}
+
 function scoreVideo(f: RawFormat): number {
   let score = f.tbr ?? 0
+  // the hls rendition of a stream carries no size and downloads slower than
+  // the plain https one it duplicates — never let it win on bitrate alone
+  if (isHls(f)) score -= 40_000
   if (f.ext === 'mp4') score += 10_000
   if (f.vcodec?.startsWith('avc')) score += 5_000
   return score

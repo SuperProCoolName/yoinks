@@ -1,0 +1,64 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import {buildChoices, type VideoInfo} from './ytdlp.js'
+
+// a youtube-shaped answer: every resolution exists twice, once as a plain
+// https stream that yt-dlp has measured and once as an hls copy it hasn't
+const youtubeish: VideoInfo = {
+  title: 'clip',
+  duration: 100,
+  formats: [
+    {format_id: '96', ext: 'mp4', vcodec: 'avc1.4d', acodec: 'none', height: 720, tbr: 900, protocol: 'm3u8_native'},
+    {format_id: '136', ext: 'mp4', vcodec: 'avc1.4d', acodec: 'none', height: 720, tbr: 600, filesize: 8_000_000, protocol: 'https'},
+    {format_id: '135', ext: 'mp4', vcodec: 'avc1.4d', acodec: 'none', height: 480, tbr: 300, filesize: 4_000_000, protocol: 'https'},
+    {format_id: '140', ext: 'm4a', vcodec: 'none', acodec: 'mp4a', abr: 129, filesize: 2_000_000, protocol: 'https'},
+    {format_id: '251', ext: 'webm', vcodec: 'none', acodec: 'opus', abr: 131, filesize: 2_100_000, protocol: 'https'},
+  ],
+}
+
+test('a resolution weighs its own video stream plus the audio it is merged with', () => {
+  const [best, second] = buildChoices(youtubeish)
+  // 8 MB video + 2 MB m4a, both measured — no tilde, and no two rows alike
+  assert.equal(best?.label, '720p · mp4 · 9.5 MB')
+  assert.equal(second?.label, '480p · mp4 · 5.7 MB')
+})
+
+test('pins the streams it measured, keeping the generic selectors as fallback', () => {
+  const [best] = buildChoices(youtubeish)
+  assert.equal(best?.args[1], '136+140/bv*[height=720]+ba/b[height=720]/bv*[height<=720]+ba/b')
+})
+
+test('an hls duplicate never wins on bitrate alone', () => {
+  // 96 has the higher bitrate but carries no size: picking it used to leave
+  // every row showing the audio track's size and nothing else
+  const [best] = buildChoices(youtubeish)
+  assert.ok(best?.args[1]?.startsWith('136+140'))
+  assert.ok(!best?.label.includes('~'))
+})
+
+test('says nothing rather than quoting a size that is missing the video', () => {
+  const sizeless: VideoInfo = {
+    title: 'clip',
+    formats: [
+      {format_id: 'v', ext: 'mp4', vcodec: 'avc1', acodec: 'none', height: 720, protocol: 'https'},
+      {format_id: 'a', ext: 'm4a', vcodec: 'none', acodec: 'mp4a', filesize: 2_000_000, protocol: 'https'},
+    ],
+  }
+  assert.equal(buildChoices(sizeless)[0]?.label, '720p · mp4')
+})
+
+test('estimates from the bitrate when nothing has been measured, and marks it as a guess', () => {
+  const hlsOnly: VideoInfo = {
+    title: 'stream',
+    duration: 60,
+    formats: [{format_id: '720', ext: 'mp4', vcodec: 'avc1', acodec: 'mp4a', height: 720, tbr: 800, protocol: 'm3u8_native'}],
+  }
+  // 800 kbit/s over 60 s ≈ 6 MB, and the tilde says it is arithmetic
+  assert.equal(buildChoices(hlsOnly)[0]?.label, '720p · mp4 · ~5.7 MB')
+})
+
+test('sizes the mp3 by what lame will write, not by the source track', () => {
+  const audio = buildChoices(youtubeish).at(-1)
+  // the 2.1 MB opus source becomes ~245 kbit/s of mp3 over 100 s
+  assert.equal(audio?.label, 'audio only · mp3 · ~2.9 MB')
+})
