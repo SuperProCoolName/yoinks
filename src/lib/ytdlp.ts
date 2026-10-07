@@ -535,9 +535,19 @@ function killTree(child: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void
 /** How long a cancelled ffmpeg gets to close its file before it is killed. */
 const KILL_GRACE_MS = 2000
 
+// Left alone, yt-dlp on Windows writes to a pipe in the system code page
+// (cp1251 on a Russian install) and silently drops whatever doesn't fit:
+// the full-width ： ？ ＂ it swaps into file names, emoji, most scripts. The
+// path it prints then names a file that doesn't exist, and a finished
+// download reads as a failed one. UTF-8 carries every name intact.
+const UTF8_OUTPUT = ['--encoding', 'utf-8']
+
 /** Spawn yt-dlp in its own process group and tie the abort signal to it. */
 function spawnYtDlp(cmd: string, args: string[], signal?: AbortSignal): ChildProcessWithoutNullStreams {
-  const child = spawn(cmd, args, {detached: OWN_GROUP})
+  const child = spawn(cmd, [...UTF8_OUTPUT, ...args], {detached: OWN_GROUP})
+  // decoded as a stream, so a character split across two chunks survives
+  child.stdout.setEncoding('utf8')
+  child.stderr.setEncoding('utf8')
   if (!signal) return child
 
   const onAbort = () => {
@@ -607,8 +617,8 @@ export function download(
     // every file yt-dlp writes this run, so a cancel can clean up after itself
     const destinations: string[] = []
 
-    child.stdout.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString()
+    child.stdout.on('data', (chunk: string) => {
+      buffer += chunk
       const lines = buffer.split('\n')
       buffer = lines.pop() ?? ''
       for (const rawLine of lines) {
@@ -645,7 +655,9 @@ export function download(
         } else if (line.startsWith('[download] Destination: ')) {
           const target = line.slice('[download] Destination: '.length)
           destinations.push(target)
-          produced ??= target
+          // a plain single-file download is never named again after this;
+          // a merge overwrites it below with the merged file
+          if (!produced) produced = target
         } else {
           // "[download] /path/file.mp4 has already been downloaded" — nothing
           // is written this run, so no post-processor names the file

@@ -3,7 +3,15 @@ import test from 'node:test'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import {buildChoices, firstWorking, isPostProcessorLine, removePartials, resolveFinalPath, type VideoInfo} from './ytdlp.js'
+import {
+  buildChoices,
+  download,
+  firstWorking,
+  isPostProcessorLine,
+  removePartials,
+  resolveFinalPath,
+  type VideoInfo,
+} from './ytdlp.js'
 
 // a youtube-shaped answer: every resolution exists twice, once as a plain
 // https stream that yt-dlp has measured and once as an hls copy it hasn't
@@ -176,3 +184,41 @@ test('a page with no formats at all still offers something to try', () => {
   const labels = buildChoices({title: 'bare'}).map(c => c.label)
   assert.deepEqual(labels, ['best available · mp4', 'audio only · mp3'])
 })
+
+// a stand-in yt-dlp: writes the file, then prints its path the way a real one
+// does on windows — in utf-8 only when asked to, and in two pieces cut through
+// the middle of a character
+const FAKE_YTDLP = `#!/usr/bin/env node
+const fs = require('fs')
+const args = process.argv.slice(2)
+const utf8 = args[args.indexOf('--encoding') + 1] === 'utf-8'
+const file = process.env.YOINKS_FAKE_FILE
+fs.writeFileSync(file, 'x')
+const line = Buffer.from('YOINKFILE|' + file + '\\n', utf8 ? 'utf8' : 'latin1')
+const cut = line.findIndex(byte => byte >= 0x80) + 1
+process.stdout.write(line.subarray(0, cut))
+setTimeout(() => process.stdout.write(line.subarray(cut)), 50)
+`
+
+test(
+  'a file named with full-width punctuation and cyrillic is reported, not lost',
+  {skip: process.platform === 'win32' && 'the stand-in is a shebang script'},
+  async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'yoinks-'))
+    const fake = path.join(dir, 'yt-dlp')
+    await fs.writeFile(fake, FAKE_YTDLP, {mode: 0o755})
+    // what yt-dlp makes of a tweet titled `post: why? Тест`
+    const file = path.join(dir, 'post： why？ Тест.mp4')
+    process.env.YOINKS_FAKE_FILE = file
+    try {
+      const found = await download(
+        {ytdlp: fake, url: 'https://x.com/i/status/1', choice: {kind: 'video', label: 'x', args: []}, outDir: dir},
+        {onProgress: () => {}, onProcessing: () => {}},
+      )
+      assert.equal(found, file)
+    } finally {
+      delete process.env.YOINKS_FAKE_FILE
+      await fs.rm(dir, {recursive: true, force: true})
+    }
+  },
+)
