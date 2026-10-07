@@ -236,8 +236,8 @@ export type VideoInfo = {
 type RawFormat = {
   format_id: string
   ext?: string
-  vcodec?: string
-  acodec?: string
+  vcodec?: string | null
+  acodec?: string | null
   height?: number
   width?: number
   abr?: number
@@ -246,6 +246,17 @@ type RawFormat = {
   filesize?: number
   filesize_approx?: number
 }
+
+// yt-dlp's own reading of the codec fields: 'none' means the stream is
+// absent, while a missing codec only means nobody said which one it is.
+// Twitter's plain mp4s name no codec at all and still carry both picture
+// and sound, and its separate audio tracks name no audio codec either
+const hasVideo = (f: RawFormat) => f.vcodec !== 'none'
+const hasAudio = (f: RawFormat) => f.acodec !== 'none'
+// a stream with no picture, or one that names only an audio codec and has
+// no frame size to suggest otherwise
+const isAudioOnly = (f: RawFormat) =>
+  hasAudio(f) && (f.vcodec === 'none' || (!f.vcodec && Boolean(f.acodec) && !f.height && !f.width))
 
 export type ProbeResult = {
   info: VideoInfo
@@ -380,7 +391,7 @@ export function buildChoices(info: VideoInfo, opts: {ffmpeg?: boolean} = {}): Do
   const canMerge = opts.ffmpeg !== false
 
   const audioOnly = formats
-    .filter(f => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'))
+    .filter(isAudioOnly)
     .sort((a, b) => scoreAudio(b) - scoreAudio(a))
   const bestAudio = audioOnly[0]
   // an m4a track drops straight into an mp4 container; opus/webm would make
@@ -388,20 +399,20 @@ export function buildChoices(info: VideoInfo, opts: {ffmpeg?: boolean} = {}): Do
   const mergeAudio = audioOnly.find(f => f.ext === 'm4a') ?? bestAudio
   const mergeAudioSize = mergeAudio ? sizeOf(mergeAudio, duration) : undefined
 
-  const playable = formats.filter(f => f.vcodec && f.vcodec !== 'none')
+  const playable = formats.filter(f => hasVideo(f) && !isAudioOnly(f))
   const videos = playable.filter(f => f.height)
   const heights = [...new Set(videos.map(f => f.height as number))].sort((a, b) => b - a)
   // with no ffmpeg a stream that already carries its own audio is worth more
   // than any bitrate — it is the only kind that arrives with sound
-  const rank = (f: RawFormat) => scoreVideo(f) + (!canMerge && f.acodec && f.acodec !== 'none' ? 100_000 : 0)
+  const rank = (f: RawFormat) => scoreVideo(f) + (!canMerge && hasAudio(f) ? 100_000 : 0)
   // when every line would say "muted" the label is just noise — the footer's
   // ffmpeg notice covers it. Only a mixed list needs marking
-  const someHaveSound = !canMerge && videos.some(f => f.acodec && f.acodec !== 'none')
+  const someHaveSound = !canMerge && videos.some(hasAudio)
 
   for (const height of heights.slice(0, MAX_VIDEO_CHOICES)) {
     const candidates = videos.filter(f => f.height === height)
     const best = [...candidates].sort((a, b) => rank(b) - rank(a))[0]
-    const muxed = Boolean(best.acodec && best.acodec !== 'none')
+    const muxed = hasAudio(best)
     const videoSize = sizeOf(best, duration)
     const size = muxed || !canMerge ? videoSize : addSizes(videoSize, mergeAudioSize)
     // name the exact streams we measured, so the number on screen is the

@@ -222,3 +222,31 @@ test(
     }
   },
 )
+
+// what twitter actually answers: plain mp4s that name no codec but carry
+// sound, silent hls copies, and audio tracks that name no audio codec
+const tweet: VideoInfo = {
+  title: 'tweet',
+  duration: 30,
+  formats: [
+    {format_id: 'hls-audio-128000-Audio', ext: 'mp4', vcodec: 'none', acodec: null, tbr: 128, protocol: 'm3u8_native'},
+    {format_id: 'http-950', ext: 'mp4', vcodec: null, acodec: null, height: 600, tbr: 950, protocol: 'https', filesize_approx: 3566062},
+    {format_id: 'hls-253', ext: 'mp4', vcodec: 'avc1.4D401F', acodec: 'none', height: 600, tbr: 254, protocol: 'm3u8_native'},
+    {format_id: 'http-2176', ext: 'mp4', vcodec: null, acodec: null, height: 900, tbr: 2176, protocol: 'https', filesize_approx: 8168160},
+    {format_id: 'hls-473', ext: 'mp4', vcodec: 'avc1.640028', acodec: 'none', height: 900, tbr: 474, protocol: 'm3u8_native'},
+  ],
+}
+
+test('a stream that names no codec is not taken for a silent one', () => {
+  const [top] = buildChoices(tweet)
+  assert.match(top.args[1], /^http-2176\//)
+  const [noFfmpeg] = buildChoices(tweet, {ffmpeg: false})
+  assert.match(noFfmpeg.args[1], /^http-2176\//)
+  assert.doesNotMatch(noFfmpeg.label, /muted/)
+})
+
+test('an audio track that names no codec still counts as audio', () => {
+  const tracks = {...tweet, formats: tweet.formats!.filter(f => f.format_id.startsWith('hls'))}
+  const [top] = buildChoices(tracks)
+  assert.match(top.args[1], /^hls-473\+hls-audio-128000-Audio\//)
+})
