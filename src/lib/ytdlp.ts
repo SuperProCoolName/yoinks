@@ -90,6 +90,47 @@ export async function firstWorking(
   return undefined
 }
 
+// what each yt-dlp answered to --version when it was picked, so an option
+// newer than some distro's copy only ever reaches a yt-dlp that knows it
+const knownVersions = new Map<string, string>()
+
+/** Whether `cmd` runs at all, remembering the version it reports. */
+export async function answersVersion(cmd: string): Promise<boolean> {
+  const version = await commandOutput(cmd, ['--version'])
+  if (version) knownVersions.set(cmd, version)
+  return version !== undefined
+}
+
+// YouTube hides its streams behind small JavaScript puzzles, and yt-dlp hands
+// them to an outside engine. Unasked it only looks for deno; without one it
+// keeps the single client that needs no puzzle solved, and that client takes
+// no cookies — so with a signed-in browser YouTube offers nothing but
+// storyboard images and yt-dlp says "Requested format is not available".
+// yoinks already runs on node, which yt-dlp accepts from 22 on
+const JS_RUNTIMES_SINCE = [2025, 11, 12] // the first yt-dlp with --js-runtimes
+const NODE_ACCEPTED_FROM = 22
+
+export function jsRuntimeArgs(
+  ytdlpVersion: string | undefined,
+  node: {version: string; path: string} = {version: process.versions.node, path: process.execPath},
+): string[] {
+  if (Number(node.version.split('.')[0]) < NODE_ACCEPTED_FROM) return []
+  // no version on record means the copy we just downloaded: the latest one
+  if (ytdlpVersion !== undefined && !atLeast(ytdlpVersion, JS_RUNTIMES_SINCE)) return []
+  return ['--js-runtimes', `node:${node.path}`]
+}
+
+function atLeast(version: string, minimum: number[]): boolean {
+  const parts = /^(\d+)\.(\d+)\.(\d+)/.exec(version)?.slice(1).map(Number)
+  // an unreadable version could be anything, and an option it doesn't know
+  // would fail every download, not just YouTube's
+  if (!parts) return false
+  for (let i = 0; i < minimum.length; i++) {
+    if (parts[i] !== minimum[i]) return parts[i] > minimum[i]
+  }
+  return true
+}
+
 /**
  * Resolve a usable yt-dlp binary: our own copy first — it is the one kept
  * fresh every week — then one already on PATH, and only then a download of
@@ -98,7 +139,7 @@ export async function firstWorking(
  */
 export async function ensureYtDlp(onStatus: (message: string) => void, signal?: AbortSignal): Promise<string> {
   const local = managedYtDlpPath()
-  const found = await firstWorking([local, 'yt-dlp'])
+  const found = await firstWorking([local, 'yt-dlp'], answersVersion)
   if (found) return found
 
   onStatus('first run: fetching yt-dlp…')
@@ -169,6 +210,7 @@ export async function updateYtDlp(signal?: AbortSignal): Promise<UpdateResult> {
   }
 
   await fetchYtDlp(local, signal)
+  knownVersions.set(local, latest)
   await markUpdateChecked(latest)
   return {status: 'updated', from: current, to: latest}
 }
@@ -555,7 +597,7 @@ const UTF8_OUTPUT = ['--encoding', 'utf-8']
 
 /** Spawn yt-dlp in its own process group and tie the abort signal to it. */
 function spawnYtDlp(cmd: string, args: string[], signal?: AbortSignal): ChildProcessWithoutNullStreams {
-  const child = spawn(cmd, [...UTF8_OUTPUT, ...args], {detached: OWN_GROUP})
+  const child = spawn(cmd, [...UTF8_OUTPUT, ...jsRuntimeArgs(knownVersions.get(cmd)), ...args], {detached: OWN_GROUP})
   // decoded as a stream, so a character split across two chunks survives
   child.stdout.setEncoding('utf8')
   child.stderr.setEncoding('utf8')

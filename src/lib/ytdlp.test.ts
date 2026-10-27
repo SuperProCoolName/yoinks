@@ -4,10 +4,13 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import {
+  answersVersion,
   buildChoices,
   download,
   firstWorking,
   isPostProcessorLine,
+  jsRuntimeArgs,
+  probe,
   removePartials,
   resolveFinalPath,
   type VideoInfo,
@@ -250,3 +253,58 @@ test('an audio track that names no codec still counts as audio', () => {
   const [top] = buildChoices(tracks)
   assert.match(top.args[1], /^hls-473\+hls-audio-128000-Audio\//)
 })
+
+test('yt-dlp is handed the node yoinks itself runs on', () => {
+  const node = {version: '22.23.2', path: 'C:\\Program Files\\nodejs\\node.exe'}
+  const expected = ['--js-runtimes', 'node:C:\\Program Files\\nodejs\\node.exe']
+  assert.deepEqual(jsRuntimeArgs('2026.10.26', node), expected)
+  assert.deepEqual(jsRuntimeArgs('2025.11.12', node), expected)
+  assert.deepEqual(jsRuntimeArgs('2025.11.12.232425', node), expected) // a nightly
+  assert.deepEqual(jsRuntimeArgs(undefined, node), expected) // just downloaded
+})
+
+test('a yt-dlp or a node too old for it is left as it was', () => {
+  const node = {version: '22.0.0', path: '/usr/bin/node'}
+  assert.deepEqual(jsRuntimeArgs('2025.10.22', node), [])
+  assert.deepEqual(jsRuntimeArgs('2024.04.09', node), [])
+  assert.deepEqual(jsRuntimeArgs('unknown', node), [])
+  assert.deepEqual(jsRuntimeArgs('2026.10.26', {version: '20.18.0', path: '/usr/bin/node'}), [])
+})
+
+// a stand-in yt-dlp of a given age that notes down how it was called
+const versionedYtDlp = (version: string) => `#!/usr/bin/env node
+const args = process.argv.slice(2)
+if (args.includes('--version')) {
+  console.log('${version}')
+} else {
+  require('fs').writeFileSync(process.env.YOINKS_FAKE_ARGS, JSON.stringify(args))
+  console.log(JSON.stringify({title: 'clip', formats: []}))
+}
+`
+
+test(
+  'only a yt-dlp that knows --js-runtimes is ever given it',
+  {skip: process.platform === 'win32' && 'the stand-in is a shebang script'},
+  async () => {
+    const nodeQualifies = Number(process.versions.node.split('.')[0]) >= 22
+    for (const [version, expected] of [
+      ['2024.04.09', false],
+      ['2026.10.26', nodeQualifies],
+    ] as const) {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'yoinks-'))
+      const fake = path.join(dir, 'yt-dlp')
+      await fs.writeFile(fake, versionedYtDlp(version), {mode: 0o755})
+      process.env.YOINKS_FAKE_ARGS = path.join(dir, 'args.json')
+      try {
+        assert.equal(await answersVersion(fake), true)
+        const {infoJsonPath} = await probe(fake, 'https://youtu.be/x')
+        await fs.rm(infoJsonPath, {force: true})
+        const args = JSON.parse(await fs.readFile(process.env.YOINKS_FAKE_ARGS, 'utf8')) as string[]
+        assert.equal(args.includes('--js-runtimes'), expected, version)
+      } finally {
+        delete process.env.YOINKS_FAKE_ARGS
+        await fs.rm(dir, {recursive: true, force: true})
+      }
+    }
+  },
+)
